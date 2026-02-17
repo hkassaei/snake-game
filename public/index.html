@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snake</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: #222;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  #scorebar {
+    display: none;
+    width: 100px; /* resized by JS */
+    color: #fff;
+    font-family: monospace;
+    font-weight: bold;
+    padding: 6px 0;
+    text-align: center;
+  }
+  #scorebar span { display: inline-block; width: 33.3%; }
+  #scorebar .left { text-align: left; }
+  #scorebar .center { text-align: center; }
+  #scorebar .right { text-align: right; }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<div id="scorebar">
+  <span class="left" id="scoreText"></span>
+  <span class="center" id="timeText"></span>
+  <span class="right" id="bestText"></span>
+</div>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+const GRID_W = 23;
+const GRID_H = 17;
+const BORDER_RATIO = 0.5; // border thickness as fraction of cellSize
+
+const UP = 0, DOWN = 1, LEFT = 2, RIGHT = 3;
+
+const STATE_MENU      = 0;
+const STATE_COUNTDOWN  = 1;
+const STATE_PLAYING    = 2;
+const STATE_PAUSED     = 3;
+const STATE_GAME_OVER  = 4;
+
+const themes = [
+  { name: "Green",  bg: "#9bba5a", dark: "#435224" },
+  { name: "Blue",   bg: "#82aad2", dark: "#1e375a" },
+  { name: "Orange", bg: "#e6b464", dark: "#78410f" },
+];
+
+const difficulties = [
+  { name: "Slug",   interval: 150 },
+  { name: "Worm",   interval: 100 },
+  { name: "Python", interval: 75  },
+];
+
+const opposites = { [UP]: DOWN, [DOWN]: UP, [LEFT]: RIGHT, [RIGHT]: LEFT };
+
+// Segment fills the cell. Cell size is capped at TARGET_CELL_SIZE (~30px)
+// so that squircles are ~30px on 1080p and touch with no gaps.
+const SEGMENT_SIZE_RATIO = 1.0;
+const TARGET_CELL_SIZE = 28;
+
+// ─── Canvas Setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+let cellSize, borderPx, canvasW, canvasH, boardPixelW, boardPixelH, boardX, boardY;
+
+function resize() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  // Determine cell size so board fits in ~85% of viewport
+  const maxBoardW = vw * 0.85;
+  const maxBoardH = vh * 0.80;
+  // Board needs GRID_W cells + 2*border wide, GRID_H cells + 2*border + extra for score/UI
+  const totalCellsW = GRID_W + 2 * BORDER_RATIO;
+  const totalCellsH = GRID_H + 2 * BORDER_RATIO + 3; // +3 for score line above + space
+  cellSize = Math.floor(Math.min(maxBoardW / totalCellsW, maxBoardH / totalCellsH, TARGET_CELL_SIZE));
+  if (cellSize < 8) cellSize = 8;
+  borderPx = Math.max(1, Math.round(cellSize * BORDER_RATIO));
+
+  boardPixelW = GRID_W * cellSize + 2 * borderPx;
+  boardPixelH = GRID_H * cellSize + 2 * borderPx;
+
+  canvasW = boardPixelW;
+  canvasH = boardPixelH;
+
+  canvas.width = canvasW;
+  canvas.height = canvasH;
+  canvas.style.width = canvasW + "px";
+  canvas.style.height = canvasH + "px";
+
+  // Size the scorebar to match board width
+  const scorebar = document.getElementById("scorebar");
+  scorebar.style.width = boardPixelW + "px";
+  const fontSize = Math.max(12, Math.floor(cellSize * 0.5));
+  scorebar.style.fontSize = fontSize + "px";
+
+  boardX = 0;
+  boardY = 0;
+
+  render();
+}
+
+// ─── Game State ─────────────────────────────────────────────────────────────
+let state = STATE_MENU;
+let themeSel = 0;
+let menuSel = 0; // difficulty index
+let snake = [];
+let dir = RIGHT;
+let nextDir = RIGHT;
+let food = { x: 0, y: 0 };
+let score = 0;
+let bestScores = [0, 0, 0]; // per difficulty
+let difficulty = 0;
+let tickTimer = null;
+
+// Countdown state
+let countdownValue = 0;
+let countdownTimer = null;
+
+// Game timer
+let gameStartTime = 0;
+let gameElapsed = 0; // frozen elapsed ms when game ends
+let gameTimerInterval = null;
+
+// Load best scores from localStorage
+try {
+  const saved = JSON.parse(localStorage.getItem("snakeBestScores"));
+  if (Array.isArray(saved) && saved.length === 3) bestScores = saved;
+} catch (e) {}
+
+function saveBest() {
+  try { localStorage.setItem("snakeBestScores", JSON.stringify(bestScores)); } catch (e) {}
+}
+
+function theme() { return themes[themeSel]; }
+
+// ─── Snake Logic ────────────────────────────────────────────────────────────
+function resetSnake() {
+  const cx = Math.floor(GRID_W / 2);
+  const cy = Math.floor(GRID_H / 2);
+  snake = [
+    { x: cx,     y: cy },
+    { x: cx - 1, y: cy },
+    { x: cx - 2, y: cy },
+  ];
+  dir = RIGHT;
+  nextDir = RIGHT;
+  score = 0;
+}
+
+function spawnFood() {
+  const occupied = new Set();
+  for (const p of snake) occupied.add(p.x + "," + p.y);
+  let p;
+  do {
+    p = { x: Math.floor(Math.random() * GRID_W), y: Math.floor(Math.random() * GRID_H) };
+  } while (occupied.has(p.x + "," + p.y));
+  food = p;
+}
+
+function setDirection(d) {
+  if (opposites[d] !== dir) nextDir = d;
+}
+
+function update() {
+  dir = nextDir;
+  const head = snake[0];
+  let nh;
+  switch (dir) {
+    case UP:    nh = { x: head.x, y: head.y - 1 }; break;
+    case DOWN:  nh = { x: head.x, y: head.y + 1 }; break;
+    case LEFT:  nh = { x: head.x - 1, y: head.y }; break;
+    case RIGHT: nh = { x: head.x + 1, y: head.y }; break;
+  }
+
+  // Wall collision
+  if (nh.x < 0 || nh.x >= GRID_W || nh.y < 0 || nh.y >= GRID_H) {
+    doGameOver();
+    return;
+  }
+  // Self collision
+  for (const p of snake) {
+    if (nh.x === p.x && nh.y === p.y) {
+      doGameOver();
+      return;
+    }
+  }
+
+  snake.unshift(nh);
+  if (nh.x === food.x && nh.y === food.y) {
+    score += 100;
+    spawnFood();
+  } else {
+    snake.pop();
+  }
+}
+
+function doGameOver() {
+  clearInterval(tickTimer);
+  tickTimer = null;
+  gameElapsed = Date.now() - gameStartTime;
+  clearInterval(gameTimerInterval);
+  gameTimerInterval = null;
+  if (score > bestScores[difficulty]) {
+    bestScores[difficulty] = score;
+    saveBest();
+  }
+  state = STATE_GAME_OVER;
+  render();
+}
+
+function startGame() {
+  difficulty = menuSel;
+  resetSnake();
+  spawnFood();
+  state = STATE_COUNTDOWN;
+  countdownValue = 3;
+  render();
+  countdownTimer = setInterval(countdownTick, 600);
+}
+
+function countdownTick() {
+  countdownValue--;
+  if (countdownValue < 0) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+    state = STATE_PLAYING;
+    gameStartTime = Date.now();
+    gameElapsed = 0;
+    gameTimerInterval = setInterval(function() { render(); }, 1000);
+    tickTimer = setInterval(gameTick, difficulties[difficulty].interval);
+  }
+  render();
+}
+
+function gameTick() {
+  update();
+  if (state === STATE_PLAYING) render();
+}
+
+// ─── Rendering ──────────────────────────────────────────────────────────────
+function render() {
+  switch (state) {
+    case STATE_MENU:      renderMenu();     break;
+    case STATE_COUNTDOWN: renderCountdown(); break;
+    case STATE_PLAYING:   renderPlaying();  break;
+    case STATE_PAUSED:    renderPaused();   break;
+    case STATE_GAME_OVER: renderGameOver(); break;
+  }
+}
+
+function fillBg() {
+  ctx.fillStyle = theme().bg;
+  ctx.fillRect(0, 0, canvasW, canvasH);
+}
+
+function drawBoard() {
+  const t = theme();
+  // Border
+  ctx.fillStyle = t.dark;
+  ctx.fillRect(boardX, boardY, boardPixelW, boardPixelH);
+  // Inner area
+  ctx.fillStyle = t.bg;
+  ctx.fillRect(
+    boardX + borderPx,
+    boardY + borderPx,
+    GRID_W * cellSize,
+    GRID_H * cellSize
+  );
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function segmentSize() {
+  return Math.max(4, Math.round(cellSize * SEGMENT_SIZE_RATIO));
+}
+
+function drawSnake() {
+  const t = theme();
+  const size = segmentSize();
+  const offset = Math.floor((cellSize - size) / 2);
+  const radius = Math.max(1, Math.floor(size * 0.25));
+  ctx.fillStyle = t.dark;
+  for (const p of snake) {
+    const px = boardX + borderPx + p.x * cellSize + offset;
+    const py = boardY + borderPx + p.y * cellSize + offset;
+    roundRect(px, py, size, size, radius);
+  }
+}
+
+function drawFood() {
+  const t = theme();
+  const size = segmentSize();
+  const offset = Math.floor((cellSize - size) / 2);
+  const radius = Math.max(1, Math.floor(size * 0.25));
+  const fx = boardX + borderPx + food.x * cellSize + offset;
+  const fy = boardY + borderPx + food.y * cellSize + offset;
+  // Outer squircle
+  ctx.fillStyle = t.dark;
+  roundRect(fx, fy, size, size, radius);
+  // Tiny center dot hole
+  const dotSize = 2;
+  const dotX = fx + Math.floor((size - dotSize) / 2);
+  const dotY = fy + Math.floor((size - dotSize) / 2);
+  ctx.fillStyle = t.bg;
+  ctx.fillRect(dotX, dotY, dotSize, dotSize);
+}
+
+function formatTime(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return (min < 10 ? "0" : "") + min + ":" + (sec < 10 ? "0" : "") + sec;
+}
+
+function drawScore() {
+  const scorebar = document.getElementById("scorebar");
+  scorebar.style.display = "flex";
+
+  document.getElementById("scoreText").textContent = "Score: " + score;
+
+  const elapsed = (state === STATE_PLAYING) ? Date.now() - gameStartTime : gameElapsed;
+  document.getElementById("timeText").textContent = "Time: " + formatTime(elapsed);
+
+  const best = bestScores[difficulty];
+  document.getElementById("bestText").textContent = best > 0 ? "Best: " + best : "";
+}
+
+function hideScore() {
+  document.getElementById("scorebar").style.display = "none";
+}
+
+function textSize(scaleFactor) {
+  return Math.max(10, Math.floor(cellSize * scaleFactor));
+}
+
+function renderMenu() {
+  hideScore();
+  fillBg();
+  const t = theme();
+  const cx = canvasW / 2;
+  let y;
+
+  // Title
+  const titleSize = textSize(1.5);
+  ctx.font = "bold " + titleSize + "px monospace";
+  ctx.fillStyle = t.dark;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  y = canvasH * 0.13;
+
+  // Title box
+  const titleText = "S N A K E";
+  const tm = ctx.measureText(titleText);
+  const boxPad = cellSize * 0.6;
+  const boxW = tm.width + boxPad * 2;
+  const boxH = titleSize * 1.6;
+  ctx.strokeStyle = t.dark;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(cx - boxW / 2, y - boxH / 2, boxW, boxH);
+  ctx.fillText(titleText, cx, y);
+
+  // Theme selector
+  const labelSize = textSize(0.65);
+  const optSize = textSize(0.7);
+  y = canvasH * 0.28;
+  ctx.font = labelSize + "px monospace";
+  ctx.fillStyle = t.dark;
+  ctx.fillText("Theme:", cx, y);
+
+  y += cellSize * 1.1;
+  ctx.font = "bold " + optSize + "px monospace";
+  let themeLabels = themes.map((th, i) => {
+    return i === themeSel ? "[ " + th.name + " ]" : "  " + th.name + "  ";
+  });
+  ctx.fillText(themeLabels.join("  "), cx, y);
+
+  y += cellSize * 0.9;
+  ctx.font = labelSize + "px monospace";
+  ctx.fillStyle = t.dark;
+  ctx.fillText("\u2190 \u2192 to change theme", cx, y);
+
+  // Difficulty selector
+  y += cellSize * 1.4;
+  ctx.font = labelSize + "px monospace";
+  ctx.fillText("Difficulty:", cx, y);
+
+  for (let i = 0; i < difficulties.length; i++) {
+    y += cellSize * 1.0;
+    const sel = i === menuSel;
+    ctx.font = (sel ? "bold " : "") + optSize + "px monospace";
+    ctx.fillStyle = t.dark;
+    const marker = sel ? "\u25b8 " : "  ";
+    ctx.fillText(marker + difficulties[i].name, cx, y);
+  }
+
+  // Controls help
+  y += cellSize * 1.6;
+  const helpSize = textSize(0.55);
+  ctx.font = helpSize + "px monospace";
+  ctx.fillStyle = t.dark;
+  ctx.fillText("\u2191 \u2193 difficulty, \u2190 \u2192 theme, Enter to start", cx, y);
+  y += cellSize * 0.8;
+  ctx.fillText("Arrow keys / WASD to move", cx, y);
+  y += cellSize * 0.8;
+  ctx.fillText("P or Space to pause, Esc for menu", cx, y);
+}
+
+function renderCountdown() {
+  hideScore();
+  fillBg();
+  drawBoard();
+
+  const t = theme();
+  const label = countdownValue > 0 ? "" + countdownValue : "GO!";
+  const fontSize = textSize(2.0);
+  ctx.font = "bold " + fontSize + "px monospace";
+  ctx.fillStyle = t.dark;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, boardX + boardPixelW / 2, boardY + boardPixelH / 2);
+}
+
+function renderPlaying() {
+  fillBg();
+  drawBoard();
+  drawFood();
+  drawSnake();
+  drawScore();
+}
+
+function renderPaused() {
+  renderPlaying();
+  drawOverlay("PAUSED");
+}
+
+function renderGameOver() {
+  fillBg();
+  drawBoard();
+  drawFood();
+  drawSnake();
+  drawScore();
+
+  const t = theme();
+  const cx = boardX + boardPixelW / 2;
+  const cy = boardY + boardPixelH / 2;
+  const fontSize = textSize(1.0);
+  const smallFont = textSize(0.65);
+
+  // Semi-transparent overlay
+  ctx.fillStyle = t.dark + "cc";
+  const overlayW = boardPixelW * 0.7;
+  const overlayH = cellSize * 7;
+  ctx.fillRect(cx - overlayW / 2, cy - overlayH / 2, overlayW, overlayH);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.font = "bold " + fontSize + "px monospace";
+  ctx.fillStyle = t.bg;
+  ctx.fillText("GAME OVER", cx, cy - cellSize * 1.5);
+
+  ctx.font = smallFont + "px monospace";
+  ctx.fillText("Score: " + score, cx, cy);
+
+  if (score > 0 && score >= bestScores[difficulty]) {
+    ctx.font = "bold " + smallFont + "px monospace";
+    ctx.fillText("NEW BEST!", cx, cy + cellSize);
+  }
+
+  ctx.font = smallFont + "px monospace";
+  ctx.fillText("Enter to play again, Esc for menu", cx, cy + cellSize * 2.5);
+}
+
+function drawOverlay(text) {
+  const t = theme();
+  const cx = boardX + boardPixelW / 2;
+  const cy = boardY + boardPixelH / 2;
+  const fontSize = textSize(1.0);
+
+  // Semi-transparent background
+  ctx.fillStyle = t.dark + "cc";
+  const pw = cellSize * 8;
+  const ph = cellSize * 2.5;
+  ctx.fillRect(cx - pw / 2, cy - ph / 2, pw, ph);
+
+  ctx.font = "bold " + fontSize + "px monospace";
+  ctx.fillStyle = t.bg;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, cx, cy);
+}
+
+// ─── Input Handling ─────────────────────────────────────────────────────────
+document.addEventListener("keydown", function(e) {
+  const key = e.key;
+
+  switch (state) {
+    case STATE_MENU:
+      handleMenuInput(key, e);
+      break;
+    case STATE_PLAYING:
+      handlePlayingInput(key, e);
+      break;
+    case STATE_PAUSED:
+      handlePausedInput(key, e);
+      break;
+    case STATE_GAME_OVER:
+      handleGameOverInput(key, e);
+      break;
+  }
+});
+
+function handleMenuInput(key, e) {
+  switch (key) {
+    case "ArrowUp": case "w": case "W":
+      e.preventDefault();
+      menuSel--;
+      if (menuSel < 0) menuSel = difficulties.length - 1;
+      render();
+      break;
+    case "ArrowDown": case "s": case "S":
+      e.preventDefault();
+      menuSel++;
+      if (menuSel >= difficulties.length) menuSel = 0;
+      render();
+      break;
+    case "ArrowLeft": case "a": case "A":
+      e.preventDefault();
+      themeSel--;
+      if (themeSel < 0) themeSel = themes.length - 1;
+      render();
+      break;
+    case "ArrowRight": case "d": case "D":
+      e.preventDefault();
+      themeSel++;
+      if (themeSel >= themes.length) themeSel = 0;
+      render();
+      break;
+    case "Enter":
+      e.preventDefault();
+      startGame();
+      break;
+  }
+}
+
+function handlePlayingInput(key, e) {
+  switch (key) {
+    case "ArrowUp": case "w": case "W":
+      e.preventDefault();
+      setDirection(UP);
+      break;
+    case "ArrowDown": case "s": case "S":
+      e.preventDefault();
+      setDirection(DOWN);
+      break;
+    case "ArrowLeft": case "a": case "A":
+      e.preventDefault();
+      setDirection(LEFT);
+      break;
+    case "ArrowRight": case "d": case "D":
+      e.preventDefault();
+      setDirection(RIGHT);
+      break;
+    case "p": case "P": case " ":
+      e.preventDefault();
+      clearInterval(tickTimer);
+      tickTimer = null;
+      gameElapsed = Date.now() - gameStartTime;
+      clearInterval(gameTimerInterval);
+      gameTimerInterval = null;
+      state = STATE_PAUSED;
+      render();
+      break;
+    case "Escape":
+      e.preventDefault();
+      clearInterval(tickTimer);
+      tickTimer = null;
+      clearInterval(gameTimerInterval);
+      gameTimerInterval = null;
+      state = STATE_MENU;
+      render();
+      break;
+  }
+}
+
+function handlePausedInput(key, e) {
+  switch (key) {
+    case "p": case "P": case " ": case "Enter":
+      e.preventDefault();
+      gameStartTime = Date.now() - gameElapsed;
+      gameTimerInterval = setInterval(function() { render(); }, 1000);
+      tickTimer = setInterval(gameTick, difficulties[difficulty].interval);
+      state = STATE_PLAYING;
+      render();
+      break;
+    case "Escape":
+      e.preventDefault();
+      state = STATE_MENU;
+      render();
+      break;
+  }
+}
+
+function handleGameOverInput(key, e) {
+  switch (key) {
+    case "Enter":
+      e.preventDefault();
+      startGame();
+      break;
+    case "Escape":
+      e.preventDefault();
+      state = STATE_MENU;
+      render();
+      break;
+  }
+}
+
+// ─── Init ───────────────────────────────────────────────────────────────────
+window.addEventListener("resize", resize);
+resize();
+</script>
+</body>
+</html>

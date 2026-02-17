@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Snake Game - Regression Tests</title>
+<style>
+  body { font-family: monospace; margin: 2em; background: #1a1a1a; color: #ccc; }
+  .pass { color: #4caf50; }
+  .fail { color: #f44336; }
+  h1 { color: #fff; }
+  pre { margin: 0.3em 0; }
+</style>
+</head>
+<body>
+<h1>Snake Game Regression Tests</h1>
+<div id="results"></div>
+<script>
+"use strict";
+
+// ─── Test harness ───────────────────────────────────────────────────────────
+let passed = 0, failed = 0;
+const output = [];
+
+function assert(condition, name, detail) {
+  if (condition) {
+    passed++;
+    output.push('<pre class="pass">  PASS: ' + name + '</pre>');
+  } else {
+    failed++;
+    output.push('<pre class="fail">  FAIL: ' + name + (detail ? " — " + detail : "") + '</pre>');
+  }
+}
+
+function extractConst(src, name) {
+  const m = src.match(new RegExp("const " + name + "\\s*=\\s*([\\d.]+)"));
+  return m ? parseFloat(m[1]) : null;
+}
+
+// ─── All tests run after fetching index.html (single source of truth) ───────
+fetch("index.html")
+  .then(r => r.text())
+  .then(src => {
+    const SEGMENT_SIZE_RATIO = extractConst(src, "SEGMENT_SIZE_RATIO");
+    const TARGET_CELL_SIZE = extractConst(src, "TARGET_CELL_SIZE");
+
+    // ── Constants exist ─────────────────────────────────────────────────
+    output.push("<h2>Constants</h2>");
+
+    assert(
+      SEGMENT_SIZE_RATIO !== null,
+      "SEGMENT_SIZE_RATIO is defined in index.html"
+    );
+    assert(
+      TARGET_CELL_SIZE !== null,
+      "TARGET_CELL_SIZE is defined in index.html"
+    );
+
+    // ── Segment sizing ──────────────────────────────────────────────────
+    output.push("<h2>Segment Sizing</h2>");
+
+    // Segment fills the cell (ratio = 1.0), no gaps.
+    assert(
+      SEGMENT_SIZE_RATIO === 1.0,
+      "SEGMENT_SIZE_RATIO is 1.0 (fills cell, no gaps)",
+      "ratio = " + SEGMENT_SIZE_RATIO
+    );
+
+    // Cell size must be reasonable (not accidentally changed).
+    assert(
+      TARGET_CELL_SIZE >= 20 && TARGET_CELL_SIZE <= 40,
+      "TARGET_CELL_SIZE is in reasonable range (20-40px)",
+      "value = " + TARGET_CELL_SIZE + "px"
+    );
+
+    // At various cell sizes, the computed segment size must be >= 4px.
+    for (const cellSize of [8, 16, 24, 32, 43, 48]) {
+      const size = Math.max(4, Math.round(cellSize * SEGMENT_SIZE_RATIO));
+      assert(
+        size >= 4,
+        "Segment size >= 4px at cellSize=" + cellSize,
+        "size = " + size + "px"
+      );
+      assert(
+        size <= cellSize,
+        "Segment size does not exceed cell at cellSize=" + cellSize,
+        "size = " + size + "px, cell = " + cellSize + "px"
+      );
+    }
+
+    // ── Source consistency ───────────────────────────────────────────────
+    output.push("<h2>Source Consistency</h2>");
+
+    // drawSnake must use segmentSize() (not a hardcoded value).
+    const snakeFn = src.match(/function drawSnake\(\)[^}]+\}/s);
+    assert(
+      snakeFn && snakeFn[0].includes("segmentSize()"),
+      "drawSnake uses shared segmentSize() helper"
+    );
+
+    // drawFood must use segmentSize() (not a hardcoded value).
+    const foodFn = src.match(/function drawFood\(\)[^}]+\}/s);
+    assert(
+      foodFn && foodFn[0].includes("segmentSize()"),
+      "drawFood uses shared segmentSize() helper"
+    );
+
+    // segmentSize must reference SEGMENT_SIZE_RATIO.
+    const sizeFn = src.match(/function segmentSize\(\)[^}]+\}/s);
+    assert(
+      sizeFn && sizeFn[0].includes("SEGMENT_SIZE_RATIO"),
+      "segmentSize() references SEGMENT_SIZE_RATIO constant"
+    );
+
+    // resize() must cap cellSize using TARGET_CELL_SIZE.
+    const resizeFn = src.match(/function resize\(\)[^}]+\}/s);
+    assert(
+      resizeFn && resizeFn[0].includes("TARGET_CELL_SIZE"),
+      "resize() uses TARGET_CELL_SIZE to cap cell size"
+    );
+
+    renderResults();
+  })
+  .catch(err => {
+    output.push('<pre class="fail">  FAIL: Could not fetch index.html — ' + err.message + '</pre>');
+    failed++;
+    renderResults();
+  });
+
+function renderResults() {
+  output.push("<h2>Summary: " + passed + " passed, " + failed + " failed</h2>");
+  document.getElementById("results").innerHTML = output.join("\n");
+  if (failed > 0) {
+    console.error("TESTS FAILED: " + failed + " failure(s)");
+  } else {
+    console.log("ALL TESTS PASSED: " + passed + " test(s)");
+  }
+}
+</script>
+</body>
+</html>
