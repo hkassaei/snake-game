@@ -18,6 +18,6 @@ function servePublicIndex(): Plugin {
 export default defineConfig({
   plugins: [
     servePublicIndex(),
-    build(),
+    build({ entry: 'src/index.ts' }),
   ],
 })
