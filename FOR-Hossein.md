@@ -70,8 +70,8 @@ This is worth understanding because it's a pattern you'll see in modern edge-dep
 
 **In development** (`npm run dev`):
 1. Vite starts a dev server
-2. The `@hono/vite-dev-server` plugin loads your Hono app (`src/index.ts`)
-3. Static files in `public/` are served directly by Vite
+2. A custom Vite plugin rewrites `/` to `/index.html` so the root URL works
+3. Static files in `public/` are served directly by Vite (the Hono app is never invoked in dev)
 4. Any changes trigger instant hot module replacement
 
 **In production** (`npm run build`):
@@ -184,7 +184,7 @@ This is a modern pattern worth understanding:
 2. **Hono** is the web framework that runs on the edge. It provides familiar Express-like routing but targeting Cloudflare Workers, Deno, and Bun instead of Node.js.
 3. **Cloudflare Pages** is the deployment target. It hosts your static files on a global CDN and runs your worker functions at the edge.
 
-The `@hono/vite-dev-server` plugin bridges Vite and Hono in development. The `@hono/vite-cloudflare-pages` plugin bridges them for production builds. Together, they give you a seamless workflow: `npm run dev` for local development, `npm run build` for production, `npm run deploy` to go live.
+The `@hono/vite-cloudflare-pages` plugin bridges Vite and Hono for production builds — it bundles the Hono app into a Cloudflare Pages worker. In development, a simple custom Vite plugin handles static file serving directly, bypassing Hono entirely (more on why in the deployment section below). Together, this gives you a seamless workflow: `npm run dev` for local development, `npm run build` for production, `npm run deploy` to go live.
 
 ### Edge Computing: Why It Matters for a Snake Game (and Everything Else)
 
@@ -216,6 +216,118 @@ Terminal games don't need responsive design — the terminal is whatever size it
 3. Recalculate everything on `window.resize`
 
 The key insight: **size everything relative to `cellSize`**, including font sizes. This way, the entire game scales uniformly. Text doesn't suddenly look tiny or huge relative to the board.
+
+### Deploying to Cloudflare: A Comedy of Errors
+
+Getting the game running locally was the easy part. Getting it deployed to Cloudflare Pages? That was a four-bug gauntlet. Each fix revealed the next problem, like peeling an onion. Here's the full story — because deployment bugs teach you more about how a platform *actually* works than any tutorial ever will.
+
+#### Bug #1: `env.ASSETS` Is Undefined (Dev Server Crash)
+
+The first version of `src/index.ts` used `serveStatic` from `hono/cloudflare-pages`:
+
+```ts
+import { serveStatic } from 'hono/cloudflare-pages'
+app.get('/*', serveStatic())
+```
+
+Ran `npm run dev`, hit `localhost:5173`, and immediately:
+
+```
+TypeError: Cannot read properties of undefined (reading 'fetch')
+    at handler.js:56:34
+```
+
+**What happened:** `serveStatic` from `hono/cloudflare-pages` calls `env.ASSETS.fetch()` internally. `ASSETS` is a special binding that Cloudflare injects at runtime — it's the service that fetches your static files from Cloudflare's CDN. But in the Vite dev server, there *is* no Cloudflare environment. `env.ASSETS` is `undefined`, so calling `.fetch()` on it blows up.
+
+**The lesson:** Cloudflare-specific APIs only exist on Cloudflare. Sounds obvious, but it's easy to forget when you're building for a platform you're not running on yet. The `@hono/vite-dev-server` plugin with its Cloudflare adapter *partially* emulates the Cloudflare environment, but it doesn't provide the `ASSETS` binding. This is a gap in the tooling.
+
+#### Bug #2: Removing `serveStatic` Causes 404 in Dev
+
+"Fine," we said, "the dev server doesn't need `serveStatic` — Vite serves `public/` files on its own." We removed `serveStatic`, leaving an empty Hono app:
+
+```ts
+const app = new Hono()
+export default app
+```
+
+Refreshed the browser: **404 Not Found**.
+
+**What happened:** The `@hono/vite-dev-server` plugin was intercepting *every* request and routing it through the Hono app. The Hono app had no routes, so it returned 404. The plugin saw a valid HTTP response (status 404) and returned it to the browser — it never fell through to Vite's static file middleware.
+
+**The fix:** We ripped out `@hono/vite-dev-server` entirely. We don't have any API routes — why run requests through Hono in dev at all? Instead, we wrote a tiny 10-line Vite plugin:
+
+```ts
+function servePublicIndex(): Plugin {
+  return {
+    name: 'serve-public-index',
+    configureServer(server) {
+      server.middlewares.use((req, _res, next) => {
+        if (req.url === '/') {
+          req.url = '/index.html'
+        }
+        next()
+      })
+    },
+  }
+}
+```
+
+This rewrites `/` to `/index.html`, and Vite's built-in static file serving picks up `public/index.html`. Simple, no dependencies, works perfectly.
+
+**The lesson:** Sometimes the right move is to *remove* a tool, not configure it differently. We had a plugin whose entire job was to pass requests to Hono — but Hono had nothing to do with them. Removing the middleman was cleaner than teaching the middleman to step aside. Don't keep dependencies you don't need; every dependency is a surface area for bugs.
+
+#### Bug #3: Build Plugin Looks for `index.tsx`, Not `index.ts`
+
+Ran `npm run build` — success. Ran `npm run deploy` — uploaded files, compiled worker... then:
+
+```
+Failed to publish your Function. Got error: Uncaught Error:
+Can't import modules from ['/src/index.tsx', '/app/server.ts']
+```
+
+**What happened:** The `@hono/vite-cloudflare-pages` build plugin generates a wrapper (`_worker.js`) that tries to import your Hono app. By default, it looks for `/src/index.tsx` or `/app/server.ts`. Our file was `/src/index.ts` (`.ts`, not `.tsx`). The generated wrapper couldn't find the import, so it threw an error at runtime on Cloudflare.
+
+**The fix:** One line — pass the explicit entry point to the build plugin:
+
+```ts
+build({ entry: 'src/index.ts' })
+```
+
+**The lesson:** Default conventions are great until they don't match your project. The plugin assumed a React-style `.tsx` entry point because most Hono apps use JSX for HTML templating. Ours doesn't — it serves static files. Always check what a build tool *assumes* about your project structure, especially when things work locally (Vite doesn't care about the extension) but fail in production (the generated Cloudflare wrapper does).
+
+#### Bug #4: Production 500 Error (The Root Route Gap)
+
+Build succeeded. Deploy succeeded. Opened the production URL: **500 Internal Server Error**.
+
+**What happened:** This one's subtle. The build generates a `_routes.json` file:
+
+```json
+{"version":1, "include":["/*"], "exclude":["/index.html","/test.html"]}
+```
+
+This tells Cloudflare: "serve `/index.html` and `/test.html` directly from CDN (fast, no worker needed). Route *everything else* through the worker." The problem? `/` (the root URL) is *not* `/index.html`. It's a different route. So when someone visits `snake-game-3j3.pages.dev`, the request goes to the worker. But we'd removed `serveStatic` from the worker back in Bug #1! The empty Hono app had no idea what to do with `/`, and Cloudflare returned a 500.
+
+**The fix:** Add `serveStatic` *back* to the Hono app:
+
+```ts
+import { serveStatic } from 'hono/cloudflare-pages'
+app.get('/*', serveStatic())
+```
+
+"Wait — didn't that crash the dev server?" Yes! But now the dev server doesn't *use* the Hono app. The custom Vite plugin handles everything in dev. The Hono app with `serveStatic` only runs in production on Cloudflare, where `env.ASSETS` actually exists. Dev and production follow different code paths, and that's perfectly fine.
+
+**The lesson:** Dev and production are *different environments*. It's tempting to want identical behavior in both, but sometimes that's not possible — and forcing it creates worse bugs. The mature approach: understand what each environment provides, and architect accordingly. In dev, Vite serves files. In production, Cloudflare's ASSETS binding serves files. Same result, different mechanisms.
+
+#### The Meta-Lesson: Dev/Prod Parity Is a Spectrum
+
+These four bugs all stem from one tension: **the Cloudflare runtime doesn't exist on your laptop.** You're building for a platform (V8 isolates at the edge) that you can only *simulate* locally. The simulation is good but imperfect. Cloudflare-specific APIs like `env.ASSETS` don't exist in Node.js. The `_routes.json` routing logic doesn't run in Vite. Default file conventions differ between tools.
+
+This isn't unique to Cloudflare. It happens with AWS Lambda, Vercel Edge Functions, Deno Deploy — any serverless platform. The local dev experience is always an *approximation* of production. The key skills:
+
+1. **Read error messages carefully.** `Cannot read properties of undefined (reading 'fetch')` tells you exactly what's missing — something is `undefined` that shouldn't be.
+2. **Understand the request lifecycle.** Who handles the request first? What happens when they can't handle it? Where does it fall through to? In our case: plugin → Hono → Vite → browser. Knowing this chain lets you diagnose where things go wrong.
+3. **Test in production early.** Don't build for weeks and deploy once. Deploy after every meaningful change. We found the production 500 immediately because we deployed right after the build worked.
+4. **Accept that dev ≠ prod.** Instead of fighting it, design for it. Our `vite.config.ts` uses a custom plugin for dev. Our `src/index.ts` uses Cloudflare APIs for production. Both work. Neither pretends to be the other.
 
 ### The Evolution of This Project
 
